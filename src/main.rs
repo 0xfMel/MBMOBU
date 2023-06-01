@@ -98,9 +98,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use std::{
-    cell::Cell,
     io::{self, ErrorKind, Write},
-    marker::PhantomData,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -110,12 +109,14 @@ use std::{
 
 use anyhow::Context;
 use memmap2::Mmap;
-use parking_lot::Mutex;
+use once_cell::sync::Lazy;
 use tokio::{
-    fs::File,
-    sync::Notify,
+    fs::{self, File},
+    io::AsyncWriteExt,
+    sync::{Mutex, MutexGuard, Notify},
     task::{self, JoinSet},
 };
+use ulid::Ulid;
 use walkdir::WalkDir;
 use zstd_safe::zstd_sys::ZSTD_EndDirective;
 
@@ -125,6 +126,13 @@ const BLOCK: u64 = (25 * 1024 * 1024) - 512;
 #[allow(clippy::cast_possible_truncation)]
 const BLOCK_USIZE: usize = BLOCK as usize;
 const DEFAULT_BUF_SIZE: usize = 8 * 1024;
+const APP_ID: &str = "mbmobu";
+
+static TMP_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    Path::new("/var/tmp")
+        .join(APP_ID)
+        .join(users::get_current_uid().to_string())
+});
 
 #[tokio::main]
 async fn main() {
@@ -155,9 +163,9 @@ async fn main() {
     });
 
     let mut compress_set = JoinSet::new();
-    let file_scheduler = FileScheduler::new();
+    let file_group_scheduler = ScheduledFileGroup::new();
     for _ in 0..COMPRESS_TASKS {
-        let mut file_scheduler_handle = file_scheduler.new_handle();
+        let mut file_group_handle = file_group_scheduler.new_handle().await;
         let base_path = base_path.to_path_buf();
         let walk_rx = walk_rx.clone_async();
         compress_set.spawn(async move {
@@ -187,17 +195,21 @@ async fn main() {
                 let max_compressed_size = max_compressed_size(meta.len(), relative)?;
 
                 if max_compressed_size > BLOCK {
-                    file_scheduler_handle.wait_for(id).await;
+                    file_group_handle.wait_for(id).await;
                     todo!("stream compression");
                 } else {
                     let bulk_buf = bulk.compress(&mmap, header, relative).with_context(|| {
                         format!("Failed to bulk compress {}", absolute.display())
                     })?;
 
-                    file_scheduler_handle.wait_for(id).await;
+                    let mut file_group = file_group_handle.wait_for(id).await;
+                    file_group.write_all(bulk_buf).await.with_context(|| {
+                        format!(
+                            "Failed to write bulk compressed file to file group: {}",
+                            absolute.display()
+                        )
+                    })?;
                 }
-
-                file_scheduler_handle.next();
             }
 
             Ok::<_, anyhow::Error>(())
@@ -206,68 +218,189 @@ async fn main() {
     drop(walk_rx);
 }
 
+struct FileGroup {
+    inner: Option<FileGroupInner>,
+    file_buf: Vec<u8>,
+    len: u64,
+}
+
+struct FileGroupInner {
+    file: File,
+    path: PathBuf,
+}
+
+impl FileGroupInner {
+    async fn new() -> anyhow::Result<Self> {
+        let path = TMP_DIR.join(Ulid::new().to_string());
+        Ok(Self {
+            file: File::open(&path)
+                .await
+                .context("Failed to create file group temp file")?,
+            path,
+        })
+    }
+}
+
+impl FileGroup {
+    fn new() -> Self {
+        Self {
+            inner: None,
+            file_buf: Vec::with_capacity(BLOCK_USIZE),
+            len: 0,
+        }
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+        let buf_len = usize_to_u64(buf.len());
+        if buf_len + self.len > BLOCK - self.len {
+            self.reset();
+        }
+
+        assert!(
+            buf_len <= BLOCK - self.len,
+            "write_all buf too big for a single block"
+        );
+
+        self.len += buf_len;
+        self.inner()
+            .await
+            .context("Failed to get file group inner")?
+            .file
+            .write_all(buf)
+            .await
+            .context("Failed to write_all directly to file group file")
+    }
+
+    async fn inner(&mut self) -> anyhow::Result<&mut FileGroupInner> {
+        if self.inner.is_none() {
+            let inner = FileGroupInner::new()
+                .await
+                .context("Failed to create new file group inner")?;
+            self.inner = Some(inner);
+        }
+
+        self.inner.as_mut().map_or_else(|| unreachable!(), Ok)
+    }
+
+    fn reset(&mut self) {
+        self.inner.take();
+    }
+}
+
+impl Drop for FileGroup {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            task::spawn(async {
+                drop(fs::remove_file(inner.path).await);
+            });
+        }
+    }
+}
+
 struct FileEntry {
     id: usize,
     path: PathBuf,
 }
 
-struct FileSchedulerInner {
-    notifiers: Mutex<Vec<Weak<Notify>>>,
+struct ScheduledFileGroupInner {
+    notifiers: Vec<Weak<Notify>>,
+    file_group: FileGroup,
+}
+
+struct ScheduledFileGroup {
+    inner: Mutex<ScheduledFileGroupInner>,
     file_id: AtomicUsize,
 }
 
-struct FileScheduler {
-    inner: Arc<FileSchedulerInner>,
-}
-
-struct FileSchedulerHandle {
-    inner: Arc<FileSchedulerInner>,
+struct FileGroupHandle {
+    scheduled: Arc<ScheduledFileGroup>,
     notify: Arc<Notify>,
 }
 
-impl FileScheduler {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(FileSchedulerInner {
-                notifiers: Mutex::new(Vec::new()),
-                file_id: AtomicUsize::new(0),
+impl ScheduledFileGroup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(ScheduledFileGroupInner {
+                notifiers: Vec::new(),
+                file_group: FileGroup::new(),
             }),
-        }
+            file_id: AtomicUsize::new(0),
+        })
     }
 
-    fn new_handle(&self) -> FileSchedulerHandle {
+    async fn new_handle(self: &Arc<Self>) -> FileGroupHandle {
         let notify = Arc::new(Notify::new());
-        self.inner.notifiers.lock().push(Arc::downgrade(&notify));
-        FileSchedulerHandle {
-            inner: Arc::clone(&self.inner),
+        self.inner
+            .lock()
+            .await
+            .notifiers
+            .push(Arc::downgrade(&notify));
+        FileGroupHandle {
+            scheduled: Arc::clone(self),
             notify,
         }
     }
 }
 
-impl FileSchedulerHandle {
-    async fn wait_for(&mut self, id: usize) {
-        loop {
-            if self.inner.file_id.load(Ordering::Acquire) == id {
-                break;
-            }
-
-            self.notify.notified().await;
-        }
-    }
-
-    fn next(&self) {
-        self.inner.file_id.fetch_add(1, Ordering::Release);
-        self.notify_all();
-    }
-
-    fn notify_all(&self) {
-        self.inner.notifiers.lock().retain(|n| {
+impl ScheduledFileGroupInner {
+    fn notify_all(&mut self) {
+        self.notifiers.retain(|n| {
             n.upgrade().map_or(false, |n| {
                 n.notify_one();
                 true
             })
         });
+    }
+}
+
+struct FileGroupGuard<'a> {
+    guard: MutexGuard<'a, ScheduledFileGroupInner>,
+    file_id: &'a AtomicUsize,
+}
+
+impl Drop for FileGroupGuard<'_> {
+    fn drop(&mut self) {
+        self.file_id.fetch_add(1, Ordering::Release);
+        self.guard.notify_all();
+    }
+}
+
+impl Deref for FileGroupGuard<'_> {
+    type Target = FileGroup;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard.file_group
+    }
+}
+
+impl DerefMut for FileGroupGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard.file_group
+    }
+}
+
+impl Drop for FileGroupHandle {
+    fn drop(&mut self) {
+        task::block_in_place(|| {
+            self.scheduled.inner.blocking_lock().notify_all();
+        });
+    }
+}
+
+impl FileGroupHandle {
+    async fn wait_for(&mut self, id: usize) -> FileGroupGuard<'_> {
+        loop {
+            if self.scheduled.file_id.load(Ordering::Acquire) == id {
+                break;
+            }
+
+            self.notify.notified().await;
+        }
+
+        FileGroupGuard {
+            guard: self.scheduled.inner.lock().await,
+            file_id: &self.scheduled.file_id,
+        }
     }
 }
 
