@@ -99,6 +99,7 @@
 
 use std::{
     io::{self, ErrorKind, Write},
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{
@@ -113,12 +114,13 @@ use once_cell::sync::Lazy;
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
-    sync::{Mutex, MutexGuard, Notify},
+    runtime::Handle,
+    sync::{Mutex, Notify, OwnedMutexGuard},
     task::{self, JoinSet},
 };
 use ulid::Ulid;
 use walkdir::WalkDir;
-use zstd_safe::zstd_sys::ZSTD_EndDirective;
+use zstd_safe::{zstd_sys::ZSTD_EndDirective, InBuffer, OutBuffer};
 
 const COMPRESS_TASKS: usize = 6;
 const LEVEL: i32 = 19;
@@ -170,6 +172,8 @@ async fn main() {
         let walk_rx = walk_rx.clone_async();
         compress_set.spawn(async move {
             let mut bulk = BulkCompressor::new().context("Failed to create bulk compressor")?;
+            let mut stream =
+                StreamCompressor::new().context("Failed to create stream compressor")?;
 
             loop {
                 let Ok(FileEntry { id, path: absolute }) = walk_rx.recv().await else {
@@ -195,15 +199,19 @@ async fn main() {
                 let max_compressed_size = max_compressed_size(meta.len(), relative)?;
 
                 if max_compressed_size > BLOCK {
-                    file_group_handle.wait_for(id).await;
-                    todo!("stream compression");
+                    let file_group = file_group_handle.wait_for(id).await;
+                    stream
+                        .compress(file_group, &mmap, header, relative)
+                        .with_context(|| {
+                            format!("Failed to stream compress {}", absolute.display())
+                        })?;
                 } else {
-                    let bulk_buf = bulk.compress(&mmap, header, relative).with_context(|| {
+                    bulk.compress(&mmap, header, relative).with_context(|| {
                         format!("Failed to bulk compress {}", absolute.display())
                     })?;
 
                     let mut file_group = file_group_handle.wait_for(id).await;
-                    file_group.write_all(bulk_buf).await.with_context(|| {
+                    file_group.write_full(&bulk.buf).await.with_context(|| {
                         format!(
                             "Failed to write bulk compressed file to file group: {}",
                             absolute.display()
@@ -241,6 +249,17 @@ impl FileGroupInner {
     }
 }
 
+enum StreamGroupWrite {
+    Continue,
+    Checkpoint,
+}
+
+impl StreamGroupWrite {
+    const fn checkpoint(&self) -> bool {
+        matches!(*self, Self::Checkpoint)
+    }
+}
+
 impl FileGroup {
     fn new() -> Self {
         Self {
@@ -250,10 +269,10 @@ impl FileGroup {
         }
     }
 
-    async fn write_all(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+    async fn write_full(&mut self, buf: &[u8]) -> anyhow::Result<()> {
         let buf_len = usize_to_u64(buf.len());
-        if buf_len + self.len > BLOCK - self.len {
-            self.reset();
+        if buf_len + self.len > BLOCK {
+            self.reset().await.context("Failed to reset file group")?;
         }
 
         assert!(
@@ -271,6 +290,20 @@ impl FileGroup {
             .context("Failed to write_all directly to file group file")
     }
 
+    async fn write_stream(&mut self, buf: &[u8]) -> anyhow::Result<StreamGroupWrite> {
+        let mut ret = StreamGroupWrite::Continue;
+        let buf_len = usize_to_u64(buf.len());
+        if buf_len + self.len > BLOCK {
+            self.reset().await.context("Failed to reset file group")?;
+            ret = StreamGroupWrite::Checkpoint;
+        }
+
+        self.len += buf_len;
+        self.file_buf.extend_from_slice(buf);
+
+        Ok(ret)
+    }
+
     async fn inner(&mut self) -> anyhow::Result<&mut FileGroupInner> {
         if self.inner.is_none() {
             let inner = FileGroupInner::new()
@@ -282,8 +315,25 @@ impl FileGroup {
         self.inner.as_mut().map_or_else(|| unreachable!(), Ok)
     }
 
-    fn reset(&mut self) {
-        self.inner.take();
+    async fn reset(&mut self) -> anyhow::Result<()> {
+        self.inner()
+            .await
+            .context("Failed to get file group inner")?;
+        let mut inner = self
+            .inner
+            .take()
+            .expect("inner should be set by above inner() call");
+
+        if !self.file_buf.is_empty() {
+            inner
+                .file
+                .write_all(&self.file_buf)
+                .await
+                .context("Failed to write file_buf to file group file")?;
+        }
+
+        self.len = 0;
+        Ok(())
     }
 }
 
@@ -308,35 +358,37 @@ struct ScheduledFileGroupInner {
 }
 
 struct ScheduledFileGroup {
-    inner: Mutex<ScheduledFileGroupInner>,
-    file_id: AtomicUsize,
+    file_group: Arc<Mutex<ScheduledFileGroupInner>>,
+    file_id: Arc<AtomicUsize>,
 }
 
 struct FileGroupHandle {
-    scheduled: Arc<ScheduledFileGroup>,
+    scheduled: Arc<Mutex<ScheduledFileGroupInner>>,
+    file_id: Arc<AtomicUsize>,
     notify: Arc<Notify>,
 }
 
 impl ScheduledFileGroup {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(ScheduledFileGroupInner {
+    fn new() -> Self {
+        Self {
+            file_group: Arc::new(Mutex::new(ScheduledFileGroupInner {
                 notifiers: Vec::new(),
                 file_group: FileGroup::new(),
-            }),
-            file_id: AtomicUsize::new(0),
-        })
+            })),
+            file_id: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
-    async fn new_handle(self: &Arc<Self>) -> FileGroupHandle {
+    async fn new_handle(&self) -> FileGroupHandle {
         let notify = Arc::new(Notify::new());
-        self.inner
+        self.file_group
             .lock()
             .await
             .notifiers
             .push(Arc::downgrade(&notify));
         FileGroupHandle {
-            scheduled: Arc::clone(self),
+            scheduled: Arc::clone(&self.file_group),
+            file_id: Arc::clone(&self.file_id),
             notify,
         }
     }
@@ -353,19 +405,19 @@ impl ScheduledFileGroupInner {
     }
 }
 
-struct FileGroupGuard<'a> {
-    guard: MutexGuard<'a, ScheduledFileGroupInner>,
-    file_id: &'a AtomicUsize,
+struct FileGroupGuard {
+    guard: OwnedMutexGuard<ScheduledFileGroupInner>,
+    file_id: Arc<AtomicUsize>,
 }
 
-impl Drop for FileGroupGuard<'_> {
+impl Drop for FileGroupGuard {
     fn drop(&mut self) {
         self.file_id.fetch_add(1, Ordering::Release);
         self.guard.notify_all();
     }
 }
 
-impl Deref for FileGroupGuard<'_> {
+impl Deref for FileGroupGuard {
     type Target = FileGroup;
 
     fn deref(&self) -> &Self::Target {
@@ -373,7 +425,7 @@ impl Deref for FileGroupGuard<'_> {
     }
 }
 
-impl DerefMut for FileGroupGuard<'_> {
+impl DerefMut for FileGroupGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard.file_group
     }
@@ -382,15 +434,15 @@ impl DerefMut for FileGroupGuard<'_> {
 impl Drop for FileGroupHandle {
     fn drop(&mut self) {
         task::block_in_place(|| {
-            self.scheduled.inner.blocking_lock().notify_all();
+            self.scheduled.blocking_lock().notify_all();
         });
     }
 }
 
 impl FileGroupHandle {
-    async fn wait_for(&mut self, id: usize) -> FileGroupGuard<'_> {
+    async fn wait_for(&mut self, id: usize) -> FileGroupGuard {
         loop {
-            if self.scheduled.file_id.load(Ordering::Acquire) == id {
+            if self.file_id.load(Ordering::Acquire) == id {
                 break;
             }
 
@@ -398,8 +450,8 @@ impl FileGroupHandle {
         }
 
         FileGroupGuard {
-            guard: self.scheduled.inner.lock().await,
-            file_id: &self.scheduled.file_id,
+            guard: Mutex::lock_owned(Arc::clone(&self.scheduled)).await,
+            file_id: Arc::clone(&self.file_id),
         }
     }
 }
@@ -437,19 +489,21 @@ pub fn usize_to_u64(value: usize) -> u64 {
 }
 
 struct BulkCompressor<'a> {
-    tar_zstd: TarZstd<'a, Vec<u8>>,
+    zstd: Zstd<'a>,
+    buf: Vec<u8>,
 }
 
 impl BulkCompressor<'_> {
     fn new() -> anyhow::Result<Self> {
-        let mut tar_zstd = TarZstd::new(Vec::with_capacity(BLOCK_USIZE));
-        tar_zstd
-            .set_level(LEVEL)
+        let mut zstd = Zstd::new();
+        zstd.set_level(LEVEL)
             .context("Failed to set zstd compression level")?;
-        tar_zstd
-            .set_long()
+        zstd.set_long()
             .context("Failed to set zstd long range matching")?;
-        Ok(Self { tar_zstd })
+        Ok(Self {
+            zstd,
+            buf: Vec::with_capacity(BLOCK_USIZE),
+        })
     }
 
     fn compress<P: AsRef<Path>>(
@@ -457,72 +511,192 @@ impl BulkCompressor<'_> {
         mmap: &Mmap,
         mut header: tar::Header,
         relative: P,
-    ) -> anyhow::Result<&mut Vec<u8>> {
+    ) -> anyhow::Result<()> {
         task::block_in_place(|| {
-            self.tar_zstd
+            TarBuilder::new(&mut *self)
                 .append_file(&mut header, relative, mmap)
                 .context("Failed to append file to archive")?;
-            self.tar_zstd
-                .end_frame()
-                .context("Failed to end zstd frame")?;
 
-            Ok::<_, anyhow::Error>(self.tar_zstd.inner_mut())
+            loop {
+                let remaining = self
+                    .zstd
+                    .end_frame(&mut self.buf)
+                    .context("Failed to end zstd frame")?;
+                if remaining == 0 {
+                    break;
+                }
+            }
+
+            Ok(())
         })
     }
 }
 
-struct TarZstd<'a, W: Write> {
-    inner: tar::Builder<Zstd<'a, W>>,
+impl TarConsumer for &mut BulkCompressor<'_> {
+    fn consume(&mut self, buf: &[u8]) -> io::Result<()> {
+        let len = buf.len();
+        let mut pos = 0;
+        loop {
+            pos += self
+                .zstd
+                .compress(buf.get(pos..).expect("buf shrunk"), &mut self.buf)?;
+
+            if pos == len {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-impl<W: Write> TarZstd<'_, W> {
-    pub fn new(inner: W) -> Self {
+struct StreamCompressor<'a> {
+    zstd: Zstd<'a>,
+    compress_buf: Vec<u8>,
+}
+
+impl StreamCompressor<'_> {
+    fn new() -> anyhow::Result<Self> {
+        let mut zstd = Zstd::new();
+        zstd.set_level(LEVEL)
+            .context("Failed to set zstd compression level")?;
+        zstd.set_long()
+            .context("Failed to set zstd long range matching")?;
+        Ok(Self {
+            zstd,
+            compress_buf: Vec::with_capacity(DEFAULT_BUF_SIZE),
+        })
+    }
+
+    fn compress<P: AsRef<Path>>(
+        &mut self,
+        file_group: FileGroupGuard,
+        mmap: &Mmap,
+        mut header: tar::Header,
+        relative: P,
+    ) -> anyhow::Result<()> {
+        TarBuilder::new(StreamTarConsumer::new(self, file_group))
+            .append_file(&mut header, relative, mmap)
+            .context("Failed to append file to archive")?;
+        Ok(())
+    }
+}
+
+struct StreamTarConsumer<'a, 'b> {
+    inner: &'b mut StreamCompressor<'a>,
+    file_group: FileGroupGuard,
+    rt: Handle,
+}
+
+impl<'a, 'b> StreamTarConsumer<'a, 'b> {
+    fn new(inner: &'b mut StreamCompressor<'a>, file_group: FileGroupGuard) -> Self {
         Self {
-            inner: tar::Builder::new(Zstd::new(inner)),
+            inner,
+            file_group,
+            rt: Handle::current(),
+        }
+    }
+}
+
+impl TarConsumer for StreamTarConsumer<'_, '_> {
+    fn consume(&mut self, buf: &[u8]) -> io::Result<()> {
+        fn block_write_stream(
+            rt: &Handle,
+            file_group: &mut FileGroupGuard,
+            buf: &mut Vec<u8>,
+        ) -> io::Result<StreamGroupWrite> {
+            let ret = rt
+                .block_on(file_group.write_stream(buf))
+                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+            buf.clear();
+            Ok(ret)
+        }
+
+        let len = buf.len();
+        let mut pos = 0;
+        #[allow(clippy::significant_drop_tightening)]
+        loop {
+            pos += self.inner.zstd.compress(
+                buf.get(pos..).expect("buf shrunk"),
+                &mut self.inner.compress_buf,
+            )?;
+
+            let chkpt =
+                block_write_stream(&self.rt, &mut self.file_group, &mut self.inner.compress_buf)?;
+
+            if chkpt.checkpoint() {
+                loop {
+                    let remaining = self.inner.zstd.end_frame(&mut self.inner.compress_buf)?;
+                    block_write_stream(
+                        &self.rt,
+                        &mut self.file_group,
+                        &mut self.inner.compress_buf,
+                    )?;
+
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+
+                // TODO - checkpoint
+            }
+
+            if pos == len {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+trait TarConsumer {
+    fn consume(&mut self, buf: &[u8]) -> io::Result<()>;
+}
+
+struct TarConsumerWriter<C> {
+    inner: C,
+}
+
+impl<C: TarConsumer> Write for TarConsumerWriter<C> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.consume(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TarBuilder<C: TarConsumer> {
+    tar: ManuallyDrop<tar::Builder<TarConsumerWriter<C>>>,
+}
+
+impl<C: TarConsumer> TarBuilder<C> {
+    fn new(consumer: C) -> Self {
+        Self {
+            tar: ManuallyDrop::new(tar::Builder::new(TarConsumerWriter { inner: consumer })),
         }
     }
 
-    pub fn set_level(&mut self, level: i32) -> io::Result<()> {
-        self.inner.get_mut().set_level(level)
-    }
-
-    pub fn set_long(&mut self) -> io::Result<()> {
-        self.inner.get_mut().set_long()
-    }
-
-    pub fn end_frame(&mut self) -> io::Result<()>
-    where
-        W: Write,
-    {
-        self.inner.get_mut().end_frame()
-    }
-
-    pub fn inner_mut(&mut self) -> &mut W {
-        self.inner.get_mut().inner_mut()
-    }
-
-    pub fn append_file<P: AsRef<Path>>(
+    fn append_file<P: AsRef<Path>>(
         &mut self,
         header: &mut tar::Header,
         path: P,
         data: &[u8],
     ) -> io::Result<()> {
-        self.inner.append_data(header, path, data)
+        self.tar.append_data(header, path, data)
     }
 }
 
-struct Zstd<'a, W> {
+struct Zstd<'a> {
     cctx: zstd_safe::CCtx<'a>,
-    inner: W,
-    buf: Vec<u8>,
 }
 
-impl<W> Zstd<'_, W> {
-    pub fn new(inner: W) -> Self {
+impl Zstd<'_> {
+    pub fn new() -> Self {
         Self {
             cctx: zstd_safe::CCtx::create(),
-            inner,
-            buf: Vec::with_capacity(DEFAULT_BUF_SIZE),
         }
     }
 
@@ -540,72 +714,27 @@ impl<W> Zstd<'_, W> {
         Ok(())
     }
 
-    pub fn end_frame(&mut self) -> io::Result<()>
-    where
-        W: Write,
-    {
-        loop {
-            if self.flush_with(ZSTD_EndDirective::ZSTD_e_end)? == 0 {
-                break;
-            }
-        }
-
-        Ok(())
+    fn compress(&mut self, buf: &[u8], out: &mut Vec<u8>) -> io::Result<usize> {
+        let mut in_buf = InBuffer::around(buf);
+        let mut out_buf = OutBuffer::around_pos(out, out.len());
+        self.cctx
+            .compress_stream2(
+                &mut out_buf,
+                &mut in_buf,
+                ZSTD_EndDirective::ZSTD_e_continue,
+            )
+            .map_err(map_zstd_error)?;
+        Ok(in_buf.pos())
     }
 
-    fn flush_with(&mut self, directive: ZSTD_EndDirective) -> io::Result<usize>
-    where
-        W: Write,
-    {
-        let mut in_buf = zstd_safe::InBuffer::around(&[]);
-        let mut out_buf = zstd_safe::OutBuffer::around(&mut self.buf);
+    fn end_frame(&mut self, out: &mut Vec<u8>) -> io::Result<usize> {
+        let mut in_buf = InBuffer::around(&[]);
+        let mut out_buf = OutBuffer::around_pos(out, out.len());
         let remaining = self
             .cctx
-            .compress_stream2(&mut out_buf, &mut in_buf, directive)
+            .compress_stream2(&mut out_buf, &mut in_buf, ZSTD_EndDirective::ZSTD_e_end)
             .map_err(map_zstd_error)?;
-
-        self.inner.write_all(&self.buf)?;
-        self.buf.clear();
-
-        self.inner.flush()?;
         Ok(remaining)
-    }
-
-    pub fn inner_mut(&mut self) -> &mut W {
-        &mut self.inner
-    }
-}
-
-impl<W: Write> Write for Zstd<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        loop {
-            let mut in_buf = zstd_safe::InBuffer::around(buf);
-            let mut out_buf = zstd_safe::OutBuffer::around(&mut self.buf);
-            self.cctx
-                .compress_stream2(
-                    &mut out_buf,
-                    &mut in_buf,
-                    ZSTD_EndDirective::ZSTD_e_continue,
-                )
-                .map_err(map_zstd_error)?;
-            self.inner.write_all(&self.buf)?;
-            self.buf.clear();
-
-            let written = in_buf.pos();
-            if written > 0 || buf.is_empty() {
-                return Ok(written);
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        loop {
-            if self.flush_with(ZSTD_EndDirective::ZSTD_e_flush)? == 0 {
-                break;
-            }
-        }
-
-        self.inner.flush()
     }
 }
 
