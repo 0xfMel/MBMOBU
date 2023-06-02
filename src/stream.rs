@@ -8,10 +8,11 @@ use memmap2::Mmap;
 use tokio::runtime::Handle;
 
 use crate::{
+    config,
     file_group::{FileGroupGuard, StreamGroupWrite},
     tar::{self, TarBuilder, TarConsumer},
     zstd::Zstd,
-    DEFAULT_BUF_SIZE, ZSTD_LEVEL,
+    DEFAULT_BUF_SIZE,
 };
 
 pub struct StreamCompressor<'a> {
@@ -21,11 +22,11 @@ pub struct StreamCompressor<'a> {
 }
 
 impl StreamCompressor<'_> {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(config: config::Compression) -> anyhow::Result<Self> {
         let mut zstd = Zstd::new();
-        zstd.set_level(ZSTD_LEVEL)
+        zstd.set_level(config.level)
             .context("Failed to set zstd compression level")?;
-        zstd.set_long()
+        zstd.set_long(config.long)
             .context("Failed to set zstd long range matching")?;
         Ok(Self {
             zstd,
@@ -39,10 +40,10 @@ impl StreamCompressor<'_> {
         mut file_group: FileGroupGuard,
         mmap: &Mmap,
         mut header: tar::Header,
-        relative: P,
+        path: P,
     ) -> anyhow::Result<()> {
         TarBuilder::new(StreamTarConsumer::new(self, &mut file_group))
-            .append_file(&mut header, relative, mmap)
+            .append_file(&mut header, path, mmap)
             .context("Failed to append file to archive")?;
 
         loop {

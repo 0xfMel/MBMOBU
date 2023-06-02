@@ -20,9 +20,9 @@ impl Zstd<'_> {
         Ok(())
     }
 
-    pub fn set_long(&mut self) -> io::Result<()> {
+    pub fn set_long(&mut self, long: bool) -> io::Result<()> {
         self.cctx
-            .set_parameter(zstd_safe::CParameter::EnableLongDistanceMatching(true))
+            .set_parameter(zstd_safe::CParameter::EnableLongDistanceMatching(long))
             .map_err(map_zstd_error)?;
         Ok(())
     }

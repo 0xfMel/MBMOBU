@@ -7,11 +7,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
+dirs = "5.0.1"
 kanal = { version = "0.1.0-pre8", features = ["std-mutex"] }
 memmap2 = "0.6.2"
 once_cell = "1.17.2"
+serde = { version = "1.0.163", features = ["derive"] }
 tarlib = {package = "tar", version = "0.4.38" }
 tokio = { version = "1.28.2", features = ["rt", "rt-multi-thread", "sync", "fs", "io-util"] }
+toml = "0.7.4"
 ulid = "1.0.0"
 users = "0.11.0"
 walkdir = "2.3.3"

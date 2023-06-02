@@ -97,6 +97,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod bulk;
+mod config;
 mod file_group;
 mod stream;
 mod tar;
@@ -122,8 +123,6 @@ use tokio::{
 };
 use walkdir::WalkDir;
 
-const COMPRESS_TASKS: usize = 6;
-const ZSTD_LEVEL: i32 = 19;
 const BLOCK: u64 = (25 * 1024 * 1024) - 512;
 #[allow(clippy::cast_possible_truncation)]
 const BLOCK_USIZE: usize = BLOCK as usize;
@@ -138,6 +137,12 @@ static TMP_DIR: Lazy<PathBuf> = Lazy::new(|| {
         .join(users::get_current_uid().to_string())
 });
 
+fn data_dir() -> anyhow::Result<PathBuf> {
+    dirs::data_local_dir()
+        .map(|d| d.join(APP_ID))
+        .context("No data local directory")
+}
+
 fn main() -> anyhow::Result<()> {
     runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -151,28 +156,45 @@ async fn start() -> anyhow::Result<()> {
     fs::create_dir_all(&*TMP_DIR)
         .await
         .context("Failed to create tmp dir")?;
+    let data_dir = data_dir()?;
+    fs::create_dir_all(&data_dir)
+        .await
+        .context("Failed to create data dir")?;
 
-    let base_path = Path::new("/data/ssd/files.bkp");
+    let config = config::get_config(data_dir)
+        .await
+        .context("Failed to get config")?;
+
     let (walk_tx, walk_rx) = kanal::bounded(1);
 
     let walker = task::spawn_blocking(move || {
         let mut id = 0;
-        for entry in WalkDir::new(base_path) {
-            let entry = entry.context("Error walking")?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
+        for bkp_path in config.paths {
+            let prefix = Path::new(&bkp_path.prefix);
+            for entry in WalkDir::new(&bkp_path.path) {
+                let entry = entry.context("Error walking")?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
 
-            if walk_tx
-                .send(FileEntry {
-                    id,
-                    path: entry.into_path(),
-                })
-                .is_err()
-            {
-                break;
+                let path = entry.into_path();
+                let relative = path.strip_prefix(&bkp_path.path).with_context(|| {
+                    format!("Failed to strip prefix for path: {}", path.display())
+                })?;
+                let entry_path = prefix.join(relative);
+
+                if walk_tx
+                    .send(FileEntry {
+                        id,
+                        path,
+                        entry_path,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                id += 1;
             }
-            id += 1;
         }
 
         Ok::<_, anyhow::Error>(())
@@ -180,25 +202,25 @@ async fn start() -> anyhow::Result<()> {
 
     let mut compress_set = JoinSet::new();
     let file_group_scheduler = ScheduledFileGroup::new();
-    for _ in 0..COMPRESS_TASKS {
+    for _ in 0..config.threads {
         let mut file_group_handle = file_group_scheduler.new_handle().await;
-        let base_path = base_path.to_path_buf();
         let walk_rx = walk_rx.clone_async();
         compress_set.spawn(async move {
-            let mut bulk = BulkCompressor::new().context("Failed to create bulk compressor")?;
-            let mut stream =
-                StreamCompressor::new().context("Failed to create stream compressor")?;
+            let mut bulk = BulkCompressor::new(config.compression)
+                .context("Failed to create bulk compressor")?;
+            let mut stream = StreamCompressor::new(config.compression)
+                .context("Failed to create stream compressor")?;
 
             loop {
-                let Ok(FileEntry { id, path: absolute }) = walk_rx.recv().await else {
+                let Ok(FileEntry { id, path, entry_path }) = walk_rx.recv().await else {
                     break;
                 };
 
-                let file = File::open(&absolute)
+                let file = File::open(&path)
                     .await
-                    .with_context(|| format!("Failed to open file: {}", absolute.display()))?;
+                    .with_context(|| format!("Failed to open file: {}", path.display()))?;
                 let meta = file.metadata().await.with_context(|| {
-                    format!("Failed to fetch metadata for file: {}", absolute.display())
+                    format!("Failed to fetch metadata for file: {}", path.display())
                 })?;
                 // SAFETY: TODO
                 let mmap = unsafe { Mmap::map(&file) }.context("Failed to mmap file")?;
@@ -207,25 +229,21 @@ async fn start() -> anyhow::Result<()> {
                 let mut header = tar::Header::new_gnu();
                 header.set_metadata(&meta);
 
-                let relative = absolute.strip_prefix(&base_path).with_context(|| {
-                    format!("Failed to strip prefix for path: {}", absolute.display())
-                })?;
-                let max_compressed_size = max_compressed_size(meta.len(), relative)?;
+                let max_compressed_size = max_compressed_size(meta.len(), &entry_path)?;
 
                 if max_compressed_size > BLOCK {
                     let file_group = file_group_handle.wait_for(id).await;
                     task::block_in_place(|| {
                         stream
-                            .compress(file_group, &mmap, header, relative)
+                            .compress(file_group, &mmap, header, entry_path)
                             .with_context(|| {
-                                format!("Failed to stream compress {}", absolute.display())
+                                format!("Failed to stream compress {}", path.display())
                             })
                     })?;
                 } else {
                     task::block_in_place(|| {
-                        bulk.compress(&mmap, header, relative).with_context(|| {
-                            format!("Failed to bulk compress {}", absolute.display())
-                        })
+                        bulk.compress(&mmap, header, entry_path)
+                            .with_context(|| format!("Failed to bulk compress {}", path.display()))
                     })?;
 
                     {
@@ -234,7 +252,7 @@ async fn start() -> anyhow::Result<()> {
                         file_group.write_full(buf).await.with_context(|| {
                             format!(
                                 "Failed to write bulk compressed file to file group: {}",
-                                absolute.display()
+                                path.display()
                             )
                         })?;
                     }
@@ -271,6 +289,7 @@ async fn start() -> anyhow::Result<()> {
 struct FileEntry {
     id: usize,
     path: PathBuf,
+    entry_path: PathBuf,
 }
 
 fn max_compressed_size<P: AsRef<Path>>(mut size: u64, path: P) -> anyhow::Result<u64> {

@@ -4,9 +4,10 @@ use anyhow::Context;
 use memmap2::Mmap;
 
 use crate::{
+    config,
     tar::{self, TarBuilder, TarConsumer},
     zstd::Zstd,
-    BLOCK_USIZE, ZSTD_LEVEL,
+    BLOCK_USIZE,
 };
 
 pub struct BulkCompressor<'a> {
@@ -15,11 +16,11 @@ pub struct BulkCompressor<'a> {
 }
 
 impl BulkCompressor<'_> {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(config: config::Compression) -> anyhow::Result<Self> {
         let mut zstd = Zstd::new();
-        zstd.set_level(ZSTD_LEVEL)
+        zstd.set_level(config.level)
             .context("Failed to set zstd compression level")?;
-        zstd.set_long()
+        zstd.set_long(config.long)
             .context("Failed to set zstd long range matching")?;
         Ok(Self {
             zstd,
@@ -31,10 +32,10 @@ impl BulkCompressor<'_> {
         &mut self,
         mmap: &Mmap,
         mut header: tar::Header,
-        relative: P,
+        path: P,
     ) -> anyhow::Result<()> {
         TarBuilder::new(&mut *self)
-            .append_file(&mut header, relative, mmap)
+            .append_file(&mut header, path, mmap)
             .context("Failed to append file to archive")?;
 
         loop {
