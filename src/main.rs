@@ -200,14 +200,18 @@ async fn main() {
 
                 if max_compressed_size > BLOCK {
                     let file_group = file_group_handle.wait_for(id).await;
-                    stream
-                        .compress(file_group, &mmap, header, relative)
-                        .with_context(|| {
-                            format!("Failed to stream compress {}", absolute.display())
-                        })?;
+                    task::block_in_place(|| {
+                        stream
+                            .compress(file_group, &mmap, header, relative)
+                            .with_context(|| {
+                                format!("Failed to stream compress {}", absolute.display())
+                            })
+                    })?;
                 } else {
-                    bulk.compress(&mmap, header, relative).with_context(|| {
-                        format!("Failed to bulk compress {}", absolute.display())
+                    task::block_in_place(|| {
+                        bulk.compress(&mmap, header, relative).with_context(|| {
+                            format!("Failed to bulk compress {}", absolute.display())
+                        })
                     })?;
 
                     let mut file_group = file_group_handle.wait_for(id).await;
@@ -512,23 +516,21 @@ impl BulkCompressor<'_> {
         mut header: tar::Header,
         relative: P,
     ) -> anyhow::Result<()> {
-        task::block_in_place(|| {
-            TarBuilder::new(&mut *self)
-                .append_file(&mut header, relative, mmap)
-                .context("Failed to append file to archive")?;
+        TarBuilder::new(&mut *self)
+            .append_file(&mut header, relative, mmap)
+            .context("Failed to append file to archive")?;
 
-            loop {
-                let remaining = self
-                    .zstd
-                    .end_frame(&mut self.buf)
-                    .context("Failed to end zstd frame")?;
-                if remaining == 0 {
-                    break;
-                }
+        loop {
+            let remaining = self
+                .zstd
+                .end_frame(&mut self.buf)
+                .context("Failed to end zstd frame")?;
+            if remaining == 0 {
+                break;
             }
+        }
 
-            Ok(())
-        })
+        Ok(())
     }
 }
 
@@ -553,6 +555,7 @@ impl TarConsumer for &mut BulkCompressor<'_> {
 struct StreamCompressor<'a> {
     zstd: Zstd<'a>,
     compress_buf: Vec<u8>,
+    rt: Handle,
 }
 
 impl StreamCompressor<'_> {
@@ -565,51 +568,68 @@ impl StreamCompressor<'_> {
         Ok(Self {
             zstd,
             compress_buf: Vec::with_capacity(DEFAULT_BUF_SIZE),
+            rt: Handle::current(),
         })
     }
 
     fn compress<P: AsRef<Path>>(
         &mut self,
-        file_group: FileGroupGuard,
+        mut file_group: FileGroupGuard,
         mmap: &Mmap,
         mut header: tar::Header,
         relative: P,
     ) -> anyhow::Result<()> {
-        TarBuilder::new(StreamTarConsumer::new(self, file_group))
+        TarBuilder::new(StreamTarConsumer::new(self, &mut file_group))
             .append_file(&mut header, relative, mmap)
             .context("Failed to append file to archive")?;
+
+        loop {
+            let remaining = self
+                .zstd
+                .end_frame(&mut self.compress_buf)
+                .context("Failed to end zstd frame")?;
+            self.block_write_stream(&mut file_group)?;
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
         Ok(())
+    }
+
+    fn block_write_stream(
+        &mut self,
+        file_group: &mut FileGroupGuard,
+    ) -> anyhow::Result<StreamGroupWrite> {
+        let ret = self
+            .rt
+            .block_on(file_group.write_stream(&self.compress_buf))
+            .context("Failed to write compress_buf to file group")?;
+        self.compress_buf.clear();
+        Ok(ret)
     }
 }
 
 struct StreamTarConsumer<'a, 'b> {
     inner: &'b mut StreamCompressor<'a>,
-    file_group: FileGroupGuard,
-    rt: Handle,
+    file_group: &'b mut FileGroupGuard,
 }
 
 impl<'a, 'b> StreamTarConsumer<'a, 'b> {
-    fn new(inner: &'b mut StreamCompressor<'a>, file_group: FileGroupGuard) -> Self {
-        Self {
-            inner,
-            file_group,
-            rt: Handle::current(),
-        }
+    fn new(inner: &'b mut StreamCompressor<'a>, file_group: &'b mut FileGroupGuard) -> Self {
+        Self { inner, file_group }
     }
 }
 
 impl TarConsumer for StreamTarConsumer<'_, '_> {
     fn consume(&mut self, buf: &[u8]) -> io::Result<()> {
         fn block_write_stream(
-            rt: &Handle,
+            this: &mut StreamCompressor<'_>,
             file_group: &mut FileGroupGuard,
-            buf: &mut Vec<u8>,
         ) -> io::Result<StreamGroupWrite> {
-            let ret = rt
-                .block_on(file_group.write_stream(buf))
-                .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-            buf.clear();
-            Ok(ret)
+            this.block_write_stream(file_group)
+                .map_err(|e| io::Error::new(ErrorKind::Other, e))
         }
 
         let len = buf.len();
@@ -621,17 +641,12 @@ impl TarConsumer for StreamTarConsumer<'_, '_> {
                 &mut self.inner.compress_buf,
             )?;
 
-            let chkpt =
-                block_write_stream(&self.rt, &mut self.file_group, &mut self.inner.compress_buf)?;
+            let chkpt = block_write_stream(self.inner, self.file_group)?;
 
             if chkpt.checkpoint() {
                 loop {
                     let remaining = self.inner.zstd.end_frame(&mut self.inner.compress_buf)?;
-                    block_write_stream(
-                        &self.rt,
-                        &mut self.file_group,
-                        &mut self.inner.compress_buf,
-                    )?;
+                    block_write_stream(self.inner, self.file_group)?;
 
                     if remaining == 0 {
                         break;
