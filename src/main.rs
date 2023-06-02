@@ -74,7 +74,6 @@
 #![warn(clippy::unneeded_field_pattern)]
 #![warn(clippy::unwrap_used)]
 #![warn(clippy::use_debug)]
-#![warn(clippy::semicolon_outside_block)]
 #![warn(clippy::mutex_atomic)]
 #![warn(clippy::let_underscore_untyped)]
 #![warn(clippy::impl_trait_in_params)]
@@ -104,7 +103,11 @@ mod tar;
 mod util;
 mod zstd;
 
-use std::path::{Path, PathBuf};
+use std::{
+    panic,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Context;
 use bulk::BulkCompressor;
@@ -113,7 +116,8 @@ use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use stream::StreamCompressor;
 use tokio::{
-    fs::File,
+    fs::{self, File},
+    runtime,
     task::{self, JoinSet},
 };
 use walkdir::WalkDir;
@@ -134,8 +138,20 @@ static TMP_DIR: Lazy<PathBuf> = Lazy::new(|| {
         .join(users::get_current_uid().to_string())
 });
 
-#[tokio::main]
-async fn main() {
+fn main() -> anyhow::Result<()> {
+    runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_keep_alive(Duration::ZERO)
+        .build()
+        .context("Failed to build Tokio runtime")?
+        .block_on(start())
+}
+
+async fn start() -> anyhow::Result<()> {
+    fs::create_dir_all(&*TMP_DIR)
+        .await
+        .context("Failed to create tmp dir")?;
+
     let base_path = Path::new("/data/ssd/files.bkp");
     let (walk_tx, walk_rx) = kanal::bounded(1);
 
@@ -212,13 +228,18 @@ async fn main() {
                         })
                     })?;
 
-                    let mut file_group = file_group_handle.wait_for(id).await;
-                    file_group.write_full(bulk.buf()).await.with_context(|| {
-                        format!(
-                            "Failed to write bulk compressed file to file group: {}",
-                            absolute.display()
-                        )
-                    })?;
+                    {
+                        let mut file_group = file_group_handle.wait_for(id).await;
+                        let buf = bulk.buf();
+                        file_group.write_full(buf).await.with_context(|| {
+                            format!(
+                                "Failed to write bulk compressed file to file group: {}",
+                                absolute.display()
+                            )
+                        })?;
+                    }
+
+                    bulk.reset();
                 }
             }
 
@@ -226,6 +247,25 @@ async fn main() {
         });
     }
     drop(walk_rx);
+
+    while let Some(task) = compress_set.join_next().await {
+        match task {
+            Ok(Err(e)) => return Err(e.context("Compress task failed")),
+            Err(e) if e.is_panic() => panic::resume_unwind(e.into_panic()),
+            Ok(Ok(_)) | Err(_) => {}
+        }
+    }
+
+    file_group_scheduler
+        .finish()
+        .await
+        .context("Failed to finish file group")?;
+
+    match walker.await {
+        Ok(Err(e)) => Err(e.context("Walker task failed")),
+        Err(e) if e.is_panic() => panic::resume_unwind(e.into_panic()),
+        Ok(Ok(_)) | Err(_) => Ok(()),
+    }
 }
 
 struct FileEntry {

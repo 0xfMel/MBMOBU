@@ -96,10 +96,11 @@ impl TarConsumer for StreamTarConsumer<'_, '_> {
 
         let len = buf.len();
         let mut pos = 0;
+        // No idea why this is triggered - error message is broken, possible false-positive
         #[allow(clippy::significant_drop_tightening)]
         loop {
             pos += self.inner.zstd.compress(
-                buf.get(pos..).expect("buf shrunk"),
+                buf.get(pos..).expect("pos should not be out of range"),
                 &mut self.inner.compress_buf,
             )?;
 

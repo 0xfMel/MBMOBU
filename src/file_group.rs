@@ -21,22 +21,23 @@ use crate::{util, BLOCK, BLOCK_USIZE, TMP_DIR};
 pub struct FileGroup {
     inner: Option<FileGroupInner>,
     file_buf: Vec<u8>,
-    len: u64,
 }
 
 struct FileGroupInner {
     file: File,
     path: PathBuf,
+    len: u64,
 }
 
 impl FileGroupInner {
     async fn new() -> anyhow::Result<Self> {
         let path = TMP_DIR.join(Ulid::new().to_string());
         Ok(Self {
-            file: File::open(&path)
+            file: File::create(&path)
                 .await
                 .context("Failed to create file group temp file")?,
             path,
+            len: 0,
         })
     }
 }
@@ -57,40 +58,35 @@ impl FileGroup {
         Self {
             inner: None,
             file_buf: Vec::with_capacity(BLOCK_USIZE),
-            len: 0,
         }
     }
 
     pub async fn write_full(&mut self, buf: &[u8]) -> anyhow::Result<()> {
         let buf_len = util::usize_to_u64(buf.len());
-        if buf_len + self.len > BLOCK {
+        if buf_len + self.inner().await?.len > BLOCK {
             self.reset().await.context("Failed to reset file group")?;
         }
 
+        let inner = self.inner().await?;
         assert!(
-            buf_len <= BLOCK - self.len,
+            buf_len <= BLOCK - inner.len,
             "write_all buf too big for a single block"
         );
 
-        self.len += buf_len;
-        self.inner()
-            .await
-            .context("Failed to get file group inner")?
-            .file
-            .write_all(buf)
-            .await
-            .context("Failed to write_all directly to file group file")
+        inner.len += buf_len;
+        self.file_buf.extend_from_slice(buf);
+        Ok(())
     }
 
     pub async fn write_stream(&mut self, buf: &[u8]) -> anyhow::Result<StreamGroupWrite> {
         let mut ret = StreamGroupWrite::Continue;
         let buf_len = util::usize_to_u64(buf.len());
-        if buf_len + self.len > BLOCK {
+        if buf_len + self.inner().await?.len > BLOCK {
             self.reset().await.context("Failed to reset file group")?;
             ret = StreamGroupWrite::Checkpoint;
         }
 
-        self.len += buf_len;
+        self.inner().await?.len += buf_len;
         self.file_buf.extend_from_slice(buf);
 
         Ok(ret)
@@ -124,7 +120,7 @@ impl FileGroup {
                 .context("Failed to write file_buf to file group file")?;
         }
 
-        self.len = 0;
+        self.file_buf.clear();
         Ok(())
     }
 }
@@ -178,6 +174,10 @@ impl ScheduledFileGroup {
             file_id: Arc::clone(&self.file_id),
             notify,
         }
+    }
+
+    pub async fn finish(self) -> anyhow::Result<()> {
+        self.file_group.lock().await.file_group.reset().await
     }
 }
 

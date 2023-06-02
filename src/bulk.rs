@@ -50,8 +50,12 @@ impl BulkCompressor<'_> {
         Ok(())
     }
 
-    pub fn buf(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
+    pub const fn buf(&self) -> &Vec<u8> {
+        &self.buf
+    }
+
+    pub fn reset(&mut self) {
+        self.buf.clear();
     }
 }
 
@@ -60,9 +64,10 @@ impl TarConsumer for &mut BulkCompressor<'_> {
         let len = buf.len();
         let mut pos = 0;
         loop {
-            pos += self
-                .zstd
-                .compress(buf.get(pos..).expect("buf shrunk"), &mut self.buf)?;
+            pos += self.zstd.compress(
+                buf.get(pos..).expect("pos should not be out of range"),
+                &mut self.buf,
+            )?;
 
             if pos == len {
                 break;
