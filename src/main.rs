@@ -96,13 +96,12 @@
 // Can't be easily fixed
 #![allow(clippy::multiple_crate_versions)]
 
-mod bulk;
+mod compression;
 mod config;
+mod encryption;
 mod file_group;
-mod stream;
 mod tar;
 mod util;
-mod zstd;
 
 use std::{
     panic,
@@ -111,11 +110,10 @@ use std::{
 };
 
 use anyhow::Context;
-use bulk::BulkCompressor;
-use file_group::ScheduledFileGroup;
+use compression::Compressor;
+use file_group::{ScheduledFileGroup, BLOCK_RESERVED};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
-use stream::StreamCompressor;
 use tokio::{
     fs::{self, File},
     runtime,
@@ -123,10 +121,12 @@ use tokio::{
 };
 use walkdir::WalkDir;
 
-const BLOCK: u64 = (25 * 1024 * 1024) - 512;
-#[allow(clippy::cast_possible_truncation)]
-const BLOCK_USIZE: usize = BLOCK as usize;
-const DEFAULT_BUF_SIZE: usize = 8 * 1024;
+const KB: usize = 1024;
+const MB: usize = 1024 * KB;
+const UPLOAD_OFFSET: usize = 512;
+const BLOCK_USIZE: usize = (25 * MB) - UPLOAD_OFFSET - BLOCK_RESERVED;
+const BLOCK: u64 = BLOCK_USIZE as u64;
+
 const APP_ID: &str = "mbmobu";
 const TAR_BLOCK: u64 = 512;
 const TAR_HEADER: u64 = TAR_BLOCK;
@@ -142,6 +142,28 @@ fn data_dir() -> anyhow::Result<PathBuf> {
         .map(|d| d.join(APP_ID))
         .context("No data local directory")
 }
+
+/*
+fn main() {
+    use chacha20poly1305::{aead::Aead, KeyInit};
+    use std::io::{Read, Write};
+
+    let file = std::fs::File::open("/var/tmp/mbmobu/1000/01H1YZ9P248TET77KV71K3735R").unwrap();
+    let mut file = std::io::BufReader::new(file);
+    let pk = encryption::get_pk(data_dir().unwrap()).unwrap();
+    let mut nonce = [0; 24];
+    file.read_exact(&mut nonce).unwrap();
+    let nonce = chacha20poly1305::XNonce::from_slice(&nonce);
+    let mut key = [0; 512];
+    file.read_exact(&mut key).unwrap();
+    let key = pk.decrypt(rsa::Pkcs1v15Encrypt, &key).unwrap();
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    let buf = cipher.decrypt(&nonce, buf.as_ref()).unwrap();
+    std::io::stdout().write_all(&buf).unwrap();
+}
+*/
 
 fn main() -> anyhow::Result<()> {
     runtime::Builder::new_multi_thread()
@@ -161,9 +183,12 @@ async fn start() -> anyhow::Result<()> {
         .await
         .context("Failed to create data dir")?;
 
-    let config = config::get_config(data_dir)
+    let config = config::get_config(&data_dir)
         .await
         .context("Failed to get config")?;
+
+    let pubk =
+        encryption::get_pubk(&config.password, data_dir).context("Failed to get public key")?;
 
     let (walk_tx, walk_rx) = kanal::bounded(1);
 
@@ -201,15 +226,13 @@ async fn start() -> anyhow::Result<()> {
     });
 
     let mut compress_set = JoinSet::new();
-    let file_group_scheduler = ScheduledFileGroup::new();
+    let file_group_scheduler = ScheduledFileGroup::new(pubk);
     for _ in 0..config.threads {
         let mut file_group_handle = file_group_scheduler.new_handle().await;
         let walk_rx = walk_rx.clone_async();
         compress_set.spawn(async move {
-            let mut bulk = BulkCompressor::new(config.compression)
-                .context("Failed to create bulk compressor")?;
-            let mut stream = StreamCompressor::new(config.compression)
-                .context("Failed to create stream compressor")?;
+            let mut compressor =
+                Compressor::new(config.compression).context("Failed to create compressor")?;
 
             loop {
                 let Ok(FileEntry { id, path, entry_path }) = walk_rx.recv().await else {
@@ -225,6 +248,8 @@ async fn start() -> anyhow::Result<()> {
                 // SAFETY: TODO
                 let mmap = unsafe { Mmap::map(&file) }.context("Failed to mmap file")?;
                 drop(file);
+                mmap.advise(memmap2::Advice::Sequential)
+                    .context("Failed to advise mmap")?;
 
                 let mut header = tar::Header::new_gnu();
                 header.set_metadata(&meta);
@@ -234,22 +259,23 @@ async fn start() -> anyhow::Result<()> {
                 if max_compressed_size > BLOCK {
                     let file_group = file_group_handle.wait_for(id).await;
                     task::block_in_place(|| {
-                        stream
-                            .compress(file_group, &mmap, header, entry_path)
+                        compressor
+                            .stream(file_group, &mmap, header, entry_path)
                             .with_context(|| {
                                 format!("Failed to stream compress {}", path.display())
                             })
                     })?;
                 } else {
                     task::block_in_place(|| {
-                        bulk.compress(&mmap, header, entry_path)
+                        compressor
+                            .bulk(&mmap, header, entry_path)
                             .with_context(|| format!("Failed to bulk compress {}", path.display()))
                     })?;
 
                     {
                         let mut file_group = file_group_handle.wait_for(id).await;
-                        let buf = bulk.buf();
-                        file_group.write_full(buf).await.with_context(|| {
+                        let buf = compressor.buf();
+                        file_group.write(buf).await.with_context(|| {
                             format!(
                                 "Failed to write bulk compressed file to file group: {}",
                                 path.display()
@@ -257,7 +283,7 @@ async fn start() -> anyhow::Result<()> {
                         })?;
                     }
 
-                    bulk.reset();
+                    compressor.reset();
                 }
             }
 
@@ -273,11 +299,6 @@ async fn start() -> anyhow::Result<()> {
             Ok(Ok(_)) | Err(_) => {}
         }
     }
-
-    file_group_scheduler
-        .finish()
-        .await
-        .context("Failed to finish file group")?;
 
     match walker.await {
         Ok(Err(e)) => Err(e.context("Walker task failed")),

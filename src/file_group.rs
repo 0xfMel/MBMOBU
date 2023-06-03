@@ -1,137 +1,147 @@
 use std::{
     ops::{Deref, DerefMut},
-    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use chacha20poly1305::{AeadCore, AeadInPlace, KeyInit, XChaCha20Poly1305, XNonce};
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::{
-    fs::{self, File},
+    fs::File,
     io::AsyncWriteExt,
     sync::{Mutex, Notify, OwnedMutexGuard},
     task,
 };
 use ulid::Ulid;
 
-use crate::{util, BLOCK, BLOCK_USIZE, TMP_DIR};
+use crate::{
+    encryption::{ZeroizeKey, RSA_BITS},
+    util, BLOCK, BLOCK_USIZE, TMP_DIR,
+};
+
+const NONCE_LEN: usize = 24;
+// constant division of power of 2s by 8
+#[allow(clippy::integer_division)]
+const ENCRYPTED_KEY_LEN: usize = RSA_BITS / 8;
+const BLOCK_HEADER: usize = NONCE_LEN + ENCRYPTED_KEY_LEN;
+// Reserved for
+// a) block header
+// b) block footer (TODO) - 63 bit counter + 1 bit flag
+// c) AEAD authentication
+pub const BLOCK_RESERVED: usize = BLOCK_HEADER + 8 + 16;
 
 pub struct FileGroup {
-    inner: Option<FileGroupInner>,
     file_buf: Vec<u8>,
-}
-
-struct FileGroupInner {
-    file: File,
-    path: PathBuf,
+    pubk: RsaPublicKey,
     len: u64,
 }
 
-impl FileGroupInner {
-    async fn new() -> anyhow::Result<Self> {
-        let path = TMP_DIR.join(Ulid::new().to_string());
-        Ok(Self {
-            file: File::create(&path)
-                .await
-                .context("Failed to create file group temp file")?,
-            path,
-            len: 0,
-        })
+struct GroupKeyNonce {
+    key: ZeroizeKey,
+    nonce: XNonce,
+}
+
+impl GroupKeyNonce {
+    fn generate() -> Self {
+        let mut rng = rand::thread_rng();
+        Self {
+            key: XChaCha20Poly1305::generate_key(&mut rng).into(),
+            nonce: XChaCha20Poly1305::generate_nonce(&mut rng),
+        }
     }
 }
 
-pub enum StreamGroupWrite {
-    Continue,
-    Checkpoint,
+pub enum HasReset {
+    Yes,
+    No,
 }
 
-impl StreamGroupWrite {
-    pub const fn checkpoint(&self) -> bool {
-        matches!(*self, Self::Checkpoint)
+impl HasReset {
+    pub const fn has_reset(&self) -> bool {
+        matches!(*self, Self::Yes)
     }
 }
 
 impl FileGroup {
-    fn new() -> Self {
+    fn new(pubk: RsaPublicKey) -> Self {
+        let mut file_buf = Vec::with_capacity(BLOCK_USIZE + BLOCK_RESERVED);
+        file_buf.resize(BLOCK_HEADER, 0);
         Self {
-            inner: None,
-            file_buf: Vec::with_capacity(BLOCK_USIZE),
+            file_buf,
+            pubk,
+            len: 0,
         }
     }
 
-    pub async fn write_full(&mut self, buf: &[u8]) -> anyhow::Result<()> {
+    pub async fn write(&mut self, buf: &[u8]) -> anyhow::Result<HasReset> {
         let buf_len = util::usize_to_u64(buf.len());
-        if buf_len + self.inner().await?.len > BLOCK {
+        let has_reset = if buf_len + self.len > BLOCK {
             self.reset().await.context("Failed to reset file group")?;
-        }
+            HasReset::Yes
+        } else {
+            HasReset::No
+        };
 
-        let inner = self.inner().await?;
         assert!(
-            buf_len <= BLOCK - inner.len,
+            buf_len <= BLOCK - self.len,
             "write_all buf too big for a single block"
         );
 
-        inner.len += buf_len;
+        self.len += buf_len;
         self.file_buf.extend_from_slice(buf);
-        Ok(())
+        Ok(has_reset)
     }
 
-    pub async fn write_stream(&mut self, buf: &[u8]) -> anyhow::Result<StreamGroupWrite> {
-        let mut ret = StreamGroupWrite::Continue;
-        let buf_len = util::usize_to_u64(buf.len());
-        if buf_len + self.inner().await?.len > BLOCK {
-            self.reset().await.context("Failed to reset file group")?;
-            ret = StreamGroupWrite::Checkpoint;
-        }
-
-        self.inner().await?.len += buf_len;
-        self.file_buf.extend_from_slice(buf);
-
-        Ok(ret)
-    }
-
-    async fn inner(&mut self) -> anyhow::Result<&mut FileGroupInner> {
-        if self.inner.is_none() {
-            let inner = FileGroupInner::new()
-                .await
-                .context("Failed to create new file group inner")?;
-            self.inner = Some(inner);
-        }
-
-        self.inner.as_mut().map_or_else(|| unreachable!(), Ok)
-    }
-
-    async fn reset(&mut self) -> anyhow::Result<()> {
-        self.inner()
-            .await
-            .context("Failed to get file group inner")?;
-        let mut inner = self
-            .inner
-            .take()
-            .expect("inner should be set by above inner() call");
-
+    pub async fn reset(&mut self) -> anyhow::Result<()> {
         if !self.file_buf.is_empty() {
-            inner
-                .file
-                .write_all(&self.file_buf)
+            let key_nonce = GroupKeyNonce::generate();
+            let cipher = XChaCha20Poly1305::new(&key_nonce.key);
+
+            let tag = cipher
+                .encrypt_in_place_detached(
+                    &key_nonce.nonce,
+                    b"",
+                    self.file_buf
+                        .get_mut(BLOCK_HEADER..)
+                        .expect("file_buf length should be greater than the block header"),
+                )
+                .map_err(|e| anyhow!("Failed to encrypt file_buf: {e}"))?;
+            self.file_buf.extend_from_slice(&tag);
+
+            let encryped_key = self
+                .pubk
+                .encrypt(
+                    &mut rand::thread_rng(),
+                    Pkcs1v15Encrypt,
+                    key_nonce.key.as_slice(),
+                )
+                .map_err(|e| anyhow!("Failed to encrypto XChaCha20-Poly1305 key: {e}"))?;
+
+            self.file_buf
+                .get_mut(0..NONCE_LEN)
+                .expect("file_buf length should be greater than the block header")
+                .copy_from_slice(key_nonce.nonce.as_slice());
+            self.file_buf
+                .get_mut(NONCE_LEN..(NONCE_LEN + ENCRYPTED_KEY_LEN))
+                .expect("file_buf length should be greater than the block header")
+                .copy_from_slice(&encryped_key);
+
+            let path = TMP_DIR.join(Ulid::new().to_string());
+            let mut file = File::create(&path)
+                .await
+                .context("Failed to create file group temp file")?;
+
+            file.write_all(&self.file_buf)
                 .await
                 .context("Failed to write file_buf to file group file")?;
         }
 
-        self.file_buf.clear();
+        self.file_buf.truncate(BLOCK_HEADER);
+        self.len = 0;
         Ok(())
-    }
-}
-
-impl Drop for FileGroup {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            task::spawn(async {
-                drop(fs::remove_file(inner.path).await);
-            });
-        }
     }
 }
 
@@ -152,11 +162,11 @@ pub struct FileGroupHandle {
 }
 
 impl ScheduledFileGroup {
-    pub fn new() -> Self {
+    pub fn new(pubk: RsaPublicKey) -> Self {
         Self {
             file_group: Arc::new(Mutex::new(ScheduledFileGroupInner {
                 notifiers: Vec::new(),
-                file_group: FileGroup::new(),
+                file_group: FileGroup::new(pubk),
             })),
             file_id: Arc::new(AtomicUsize::new(0)),
         }
@@ -174,10 +184,6 @@ impl ScheduledFileGroup {
             file_id: Arc::clone(&self.file_id),
             notify,
         }
-    }
-
-    pub async fn finish(self) -> anyhow::Result<()> {
-        self.file_group.lock().await.file_group.reset().await
     }
 }
 
