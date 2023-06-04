@@ -35,7 +35,7 @@ pub const BLOCK_RESERVED: usize = BLOCK_HEADER + 8 + 16;
 
 pub struct FileGroup {
     file_buf: Vec<u8>,
-    pubk: RsaPublicKey,
+    pk: RsaPublicKey,
     len: u64,
 }
 
@@ -54,35 +54,25 @@ impl GroupKeyNonce {
     }
 }
 
-pub enum HasReset {
-    Yes,
-    No,
-}
-
-impl HasReset {
-    pub const fn has_reset(&self) -> bool {
-        matches!(*self, Self::Yes)
-    }
-}
-
 impl FileGroup {
-    fn new(pubk: RsaPublicKey) -> Self {
+    fn new(pk: RsaPublicKey) -> Self {
         let mut file_buf = Vec::with_capacity(BLOCK_USIZE + BLOCK_RESERVED);
         file_buf.resize(BLOCK_HEADER, 0);
         Self {
             file_buf,
-            pubk,
+            pk,
             len: 0,
         }
     }
 
-    pub async fn write(&mut self, buf: &[u8]) -> anyhow::Result<HasReset> {
+    pub async fn write(&mut self, buf: &[u8]) -> anyhow::Result<Option<Ulid>> {
         let buf_len = util::usize_to_u64(buf.len());
-        let has_reset = if buf_len + self.len > BLOCK {
-            self.reset().await.context("Failed to reset file group")?;
-            HasReset::Yes
+        // requires async
+        #[allow(clippy::if_then_some_else_none)]
+        let reset_id = if buf_len + self.len > BLOCK {
+            Some(self.reset().await.context("Failed to reset file group")?)
         } else {
-            HasReset::No
+            None
         };
 
         assert!(
@@ -92,56 +82,55 @@ impl FileGroup {
 
         self.len += buf_len;
         self.file_buf.extend_from_slice(buf);
-        Ok(has_reset)
+        Ok(reset_id)
     }
 
-    pub async fn reset(&mut self) -> anyhow::Result<()> {
-        if !self.file_buf.is_empty() {
-            let key_nonce = GroupKeyNonce::generate();
-            let cipher = XChaCha20Poly1305::new(&key_nonce.key);
+    pub async fn reset(&mut self) -> anyhow::Result<Ulid> {
+        let key_nonce = GroupKeyNonce::generate();
+        let cipher = XChaCha20Poly1305::new(&key_nonce.key);
 
-            let tag = cipher
-                .encrypt_in_place_detached(
-                    &key_nonce.nonce,
-                    b"",
-                    self.file_buf
-                        .get_mut(BLOCK_HEADER..)
-                        .expect("file_buf length should be greater than the block header"),
-                )
-                .map_err(|e| anyhow!("Failed to encrypt file_buf: {e}"))?;
-            self.file_buf.extend_from_slice(&tag);
+        let tag = cipher
+            .encrypt_in_place_detached(
+                &key_nonce.nonce,
+                b"",
+                self.file_buf
+                    .get_mut(BLOCK_HEADER..)
+                    .expect("file_buf length should be greater than the block header"),
+            )
+            .map_err(|e| anyhow!("Failed to encrypt file_buf: {e}"))?;
+        self.file_buf.extend_from_slice(&tag);
 
-            let encryped_key = self
-                .pubk
-                .encrypt(
-                    &mut rand::thread_rng(),
-                    Pkcs1v15Encrypt,
-                    key_nonce.key.as_slice(),
-                )
-                .map_err(|e| anyhow!("Failed to encrypto XChaCha20-Poly1305 key: {e}"))?;
+        let encryped_key = self
+            .pk
+            .encrypt(
+                &mut rand::thread_rng(),
+                Pkcs1v15Encrypt,
+                key_nonce.key.as_slice(),
+            )
+            .map_err(|e| anyhow!("Failed to encrypto XChaCha20-Poly1305 key: {e}"))?;
 
-            self.file_buf
-                .get_mut(0..NONCE_LEN)
-                .expect("file_buf length should be greater than the block header")
-                .copy_from_slice(key_nonce.nonce.as_slice());
-            self.file_buf
-                .get_mut(NONCE_LEN..(NONCE_LEN + ENCRYPTED_KEY_LEN))
-                .expect("file_buf length should be greater than the block header")
-                .copy_from_slice(&encryped_key);
+        self.file_buf
+            .get_mut(0..NONCE_LEN)
+            .expect("file_buf length should be greater than the block header")
+            .copy_from_slice(key_nonce.nonce.as_slice());
+        self.file_buf
+            .get_mut(NONCE_LEN..(NONCE_LEN + ENCRYPTED_KEY_LEN))
+            .expect("file_buf length should be greater than the block header")
+            .copy_from_slice(&encryped_key);
 
-            let path = TMP_DIR.join(Ulid::new().to_string());
-            let mut file = File::create(&path)
-                .await
-                .context("Failed to create file group temp file")?;
+        let id = Ulid::new();
+        let path = TMP_DIR.join(id.to_string());
+        let mut file = File::create(&path)
+            .await
+            .context("Failed to create file group temp file")?;
 
-            file.write_all(&self.file_buf)
-                .await
-                .context("Failed to write file_buf to file group file")?;
-        }
+        file.write_all(&self.file_buf)
+            .await
+            .context("Failed to write file_buf to file group file")?;
 
         self.file_buf.truncate(BLOCK_HEADER);
         self.len = 0;
-        Ok(())
+        Ok(id)
     }
 }
 
@@ -162,11 +151,11 @@ pub struct FileGroupHandle {
 }
 
 impl ScheduledFileGroup {
-    pub fn new(pubk: RsaPublicKey) -> Self {
+    pub fn new(pk: RsaPublicKey) -> Self {
         Self {
             file_group: Arc::new(Mutex::new(ScheduledFileGroupInner {
                 notifiers: Vec::new(),
-                file_group: FileGroup::new(pubk),
+                file_group: FileGroup::new(pk),
             })),
             file_id: Arc::new(AtomicUsize::new(0)),
         }
@@ -184,6 +173,14 @@ impl ScheduledFileGroup {
             file_id: Arc::clone(&self.file_id),
             notify,
         }
+    }
+
+    pub async fn finish(self) -> anyhow::Result<()> {
+        let mut guard = self.file_group.lock().await;
+        if !guard.file_group.file_buf.is_empty() {
+            guard.file_group.reset().await?;
+        }
+        Ok(())
     }
 }
 

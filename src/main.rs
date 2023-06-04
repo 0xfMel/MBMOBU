@@ -169,6 +169,7 @@ fn main() -> anyhow::Result<()> {
     runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_keep_alive(Duration::ZERO)
+        .enable_time()
         .build()
         .context("Failed to build Tokio runtime")?
         .block_on(start())
@@ -187,8 +188,7 @@ async fn start() -> anyhow::Result<()> {
         .await
         .context("Failed to get config")?;
 
-    let pubk =
-        encryption::get_pubk(&config.password, data_dir).context("Failed to get public key")?;
+    let pk = encryption::get_pk(&config.password, data_dir).context("Failed to get public key")?;
 
     let (walk_tx, walk_rx) = kanal::bounded(1);
 
@@ -226,7 +226,7 @@ async fn start() -> anyhow::Result<()> {
     });
 
     let mut compress_set = JoinSet::new();
-    let file_group_scheduler = ScheduledFileGroup::new(pubk);
+    let file_group_scheduler = ScheduledFileGroup::new(pk);
     for _ in 0..config.threads {
         let mut file_group_handle = file_group_scheduler.new_handle().await;
         let walk_rx = walk_rx.clone_async();
@@ -299,6 +299,11 @@ async fn start() -> anyhow::Result<()> {
             Ok(Ok(_)) | Err(_) => {}
         }
     }
+
+    file_group_scheduler
+        .finish()
+        .await
+        .context("Failed to finish file group")?;
 
     match walker.await {
         Ok(Err(e)) => Err(e.context("Walker task failed")),

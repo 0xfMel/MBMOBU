@@ -25,34 +25,34 @@ const SALT_LEN: usize = 32;
 pub const RSA_BITS: usize = 4096;
 
 const KEYS_DIR: &str = "keys";
-const PUBKEY_FILE: &str = "keys/pub.der";
-const PRIVKEY_FILE: &str = "keys/priv.bin";
+const PK_FILE: &str = "keys/pub.der";
+const SK_FILE: &str = "keys/priv.bin";
 
-pub fn get_pubk<P: AsRef<Path>>(config: &PassConfig, data_dir: P) -> anyhow::Result<RsaPublicKey> {
-    let pubk_file = data_dir.as_ref().join(PUBKEY_FILE);
-    match File::open(&pubk_file) {
-        Ok(mut pubk_file) => {
+pub fn get_pk<P: AsRef<Path>>(config: &PassConfig, data_dir: P) -> anyhow::Result<RsaPublicKey> {
+    let pk_file = data_dir.as_ref().join(PK_FILE);
+    match File::open(&pk_file) {
+        Ok(mut pk_file) => {
             let mut buf = Vec::new();
-            pubk_file
+            pk_file
                 .read_to_end(&mut buf)
                 .context("Failed to read from public key file")?;
-            let pubk = RsaPublicKey::from_public_key_der(&buf)
+            let pk = RsaPublicKey::from_public_key_der(&buf)
                 .map_err(|e| anyhow!("Invalid public key: {e}"))?;
-            Ok(pubk)
+            Ok(pk)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let pk_file = data_dir.as_ref().join(PRIVKEY_FILE);
-            match File::open(pk_file)
+            let secret_key_file = data_dir.as_ref().join(SK_FILE);
+            match File::open(secret_key_file)
                 .map_err(Into::into)
-                .and_then(|f| load_pk(&f))
+                .and_then(|f| load_sk(&f))
             {
-                Ok(pk) => {
-                    let pubk = pk.to_public_key();
-                    save_pubk(&pubk_file, &pubk).context("Failed to save public key")?;
-                    Ok(pubk)
+                Ok(sk) => {
+                    let pk = sk.to_public_key();
+                    save_pk(&pk_file, &pk).context("Failed to save public key")?;
+                    Ok(pk)
                 }
                 Err(_) => {
-                    gen_key(config, data_dir, pubk_file).context("Failed to generate new keypair")
+                    gen_key(config, data_dir, pk_file).context("Failed to generate new keypair")
                 }
             }
         }
@@ -60,9 +60,9 @@ pub fn get_pubk<P: AsRef<Path>>(config: &PassConfig, data_dir: P) -> anyhow::Res
     }
 }
 
-pub fn get_pk<P: AsRef<Path>>(data_dir: P) -> anyhow::Result<RsaPrivateKey> {
-    match File::open(data_dir.as_ref().join(PRIVKEY_FILE)) {
-        Ok(file) => load_pk(&file),
+pub fn get_sk<P: AsRef<Path>>(data_dir: P) -> anyhow::Result<RsaPrivateKey> {
+    match File::open(data_dir.as_ref().join(SK_FILE)) {
+        Ok(file) => load_sk(&file),
         Err(e) if e.kind() == ErrorKind::NotFound => bail!("Private key not found"),
         Err(e) => Err(e).context("Failed to open private key file"),
     }
@@ -99,7 +99,7 @@ impl DerefMut for ZeroizeKey {
     }
 }
 
-fn load_pk(pk_file: &File) -> anyhow::Result<RsaPrivateKey> {
+fn load_sk(sk_file: &File) -> anyhow::Result<RsaPrivateKey> {
     // constant division of power of 2s by 8
     #[allow(clippy::integer_division)]
     #[derive(Default)]
@@ -109,31 +109,31 @@ fn load_pk(pk_file: &File) -> anyhow::Result<RsaPrivateKey> {
         parallel: [u8; (u32::BITS / 8) as usize],
         salt: [u8; SALT_LEN],
         nonce: XNonce,
-        pk: Vec<u8>,
+        sk: Vec<u8>,
     }
 
     let mut chacha = ChaCha::default();
-    let mut pk_reader = BufReader::new(pk_file);
-    pk_reader
+    let mut sk_reader = BufReader::new(sk_file);
+    sk_reader
         .read_exact(&mut chacha.t_cost)
         .context("Failed to read time cost from file")?;
-    pk_reader
+    sk_reader
         .read_exact(&mut chacha.m_cost)
         .context("Failed to read memory cost from file")?;
-    pk_reader
+    sk_reader
         .read_exact(&mut chacha.parallel)
         .context("Failed to read parallelism from file")?;
-    pk_reader
+    sk_reader
         .read_exact(&mut chacha.salt)
         .context("Failed to read salt from file")?;
-    pk_reader
+    sk_reader
         .read_exact(chacha.nonce.as_mut_slice())
         .context("Failed to read nonce from file")?;
-    pk_reader
-        .read_to_end(&mut chacha.pk)
+    sk_reader
+        .read_to_end(&mut chacha.sk)
         .context("Failed to read encrypted private key from file")?;
 
-    let mut buf = Zeroizing::new(Vec::with_capacity(chacha.pk.len()));
+    let mut buf = Zeroizing::new(Vec::with_capacity(chacha.sk.len()));
 
     let buf = loop {
         let mut pass =
@@ -157,7 +157,7 @@ fn load_pk(pk_file: &File) -> anyhow::Result<RsaPrivateKey> {
         eprint!("Decrypting private key...");
         let chacha_cipher = XChaCha20Poly1305::new_from_slice(&key)
             .map_err(|e| anyhow!("Failed to create XChaCha20-Poly1305 cipher: {e}"))?;
-        buf.extend_from_slice(&chacha.pk);
+        buf.extend_from_slice(&chacha.sk);
         let decrypt = chacha_cipher.decrypt_in_place(&chacha.nonce, b"", &mut *buf);
         eprintln!();
 
@@ -181,7 +181,7 @@ fn load_pk(pk_file: &File) -> anyhow::Result<RsaPrivateKey> {
 fn gen_key<P1: AsRef<Path>, P2: AsRef<Path>>(
     config: &PassConfig,
     data_dir: P1,
-    pubk_file: P2,
+    pk_file: P2,
 ) -> anyhow::Result<RsaPublicKey> {
     let mut pass =
         get_pass("Enter new encryption password: ", true).context("Failed to get password")?;
@@ -207,17 +207,17 @@ fn gen_key<P1: AsRef<Path>, P2: AsRef<Path>>(
     eprintln!();
 
     eprint!("Generating RSA key...");
-    let pk = RsaPrivateKey::new(&mut rng, RSA_BITS)
+    let sk = RsaPrivateKey::new(&mut rng, RSA_BITS)
         .map_err(|e| anyhow!("Failed to generate RSA key: {e}"))?;
-    let pubk = pk.to_public_key();
+    let pk = sk.to_public_key();
     eprintln!();
 
     eprint!("Encrypting private key...");
     let chacha_cipher = XChaCha20Poly1305::new_from_slice(&key)
         .map_err(|e| anyhow!("Failed to create XChaCha20-Poly1305 cipher: {e}"))?;
     let nonce = XChaCha20Poly1305::generate_nonce(&mut rng);
-    let pk_buf = {
-        let der = pk
+    let sk_buf = {
+        let der = sk
             .to_pkcs1_der()
             .map_err(|e| anyhow!("Failed to get private key in der format: {e}"))?;
         let der = der.to_bytes();
@@ -228,7 +228,7 @@ fn gen_key<P1: AsRef<Path>, P2: AsRef<Path>>(
             .map_err(|e| anyhow!("Failed to encrypt private key: {e}"))?;
         buf
     };
-    drop(pk);
+    drop(sk);
     eprintln!();
 
     let keys_dir = data_dir.as_ref().join(KEYS_DIR);
@@ -238,7 +238,7 @@ fn gen_key<P1: AsRef<Path>, P2: AsRef<Path>>(
     }
 
     let mut priv_file = BufWriter::new(
-        File::create(data_dir.as_ref().join(PRIVKEY_FILE))
+        File::create(data_dir.as_ref().join(SK_FILE))
             .context("Failed to create private key file")?,
     );
 
@@ -258,25 +258,25 @@ fn gen_key<P1: AsRef<Path>, P2: AsRef<Path>>(
         .write_all(nonce.as_slice())
         .context("Failed to write nonce to file")?;
     priv_file
-        .write_all(&pk_buf)
+        .write_all(&sk_buf)
         .context("Failed to write encrypted private key to file")?;
     priv_file
         .flush()
         .context("Failed to flush private key file")?;
     drop(priv_file);
 
-    save_pubk(pubk_file, &pubk).context("Failed to save public key")?;
+    save_pk(pk_file, &pk).context("Failed to save public key")?;
     eprintln!("Done");
-    Ok(pubk)
+    Ok(pk)
 }
 
-fn save_pubk<P: AsRef<Path>>(pubk_file: P, pubk: &RsaPublicKey) -> anyhow::Result<()> {
-    let pubk_der = pubk
+fn save_pk<P: AsRef<Path>>(pk_file: P, pk: &RsaPublicKey) -> anyhow::Result<()> {
+    let pk_der = pk
         .to_public_key_der()
         .map_err(|e| anyhow!("Failed to get public key in der format: {e}"))?;
-    File::create(pubk_file.as_ref())
+    File::create(pk_file.as_ref())
         .context("Failed to create public key file")?
-        .write_all(pubk_der.as_bytes())
+        .write_all(pk_der.as_bytes())
         .context("Failed to write to public key file")
 }
 

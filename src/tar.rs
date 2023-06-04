@@ -6,8 +6,10 @@ use std::{
 
 pub use tarlib::Header;
 
+use crate::util::AnyhowExt;
+
 pub trait TarConsumer {
-    fn consume(&mut self, buf: &[u8]) -> io::Result<()>;
+    fn consume(&mut self, buf: &[u8]) -> anyhow::Result<()>;
 }
 
 struct TarConsumerWriter<C> {
@@ -16,7 +18,7 @@ struct TarConsumerWriter<C> {
 
 impl<C: TarConsumer> Write for TarConsumerWriter<C> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.consume(buf)?;
+        self.inner.consume(buf).into_io()?;
         Ok(buf.len())
     }
 
